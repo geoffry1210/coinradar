@@ -7,6 +7,10 @@
 //   /whale — Recent large transfers for a token
 //   /start, /help, /upgrade, /mystatus
 //   Admin: /broadcast, /status, /testalert
+//
+// Runs on Telegram AND Discord from this single file.
+//   Discord: slash commands mirror the Telegram commands 1:1 (see DISCORD LAYER at the bottom).
+//   Set DISCORD_TOKEN + DISCORD_CLIENT_ID to switch the Discord side on; leave unset for Telegram only.
 
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
@@ -14,7 +18,6 @@ const fetch = require('node-fetch');
 const http = require('http');
 const https = require('https');
 const { AsyncLocalStorage } = require('async_hooks');
-const express = require('express');
 
 // Disable keep-alive to avoid stale sockets causing "Premature close" errors
 // on long-running processes (node-fetch v2 known issue)
@@ -58,20 +61,6 @@ async function initDb() {
   await pool.query(`ALTER TABLE usage_log ADD COLUMN IF NOT EXISTS command TEXT NOT NULL DEFAULT '';`);
   await pool.query(`ALTER TABLE usage_log DROP CONSTRAINT IF EXISTS usage_log_pkey;`);
   await pool.query(`ALTER TABLE usage_log ADD CONSTRAINT usage_log_pkey PRIMARY KEY (user_id, day, command);`);
-  // Tracks EVERY user who has ever sent the bot a message, regardless of
-  // which command (free or premium) or whether they're the admin.
-  // usage_log only ever gets a row from the premium free-trial path
-  // (and admin is explicitly exempted from it), so it badly undercounts
-  // real users — this table is the actual source of truth for /broadcast.
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS known_users (
-      user_id BIGINT PRIMARY KEY,
-      chat_id BIGINT,
-      username TEXT,
-      first_seen BIGINT,
-      last_seen BIGINT
-    );
-  `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS paid_chats (
       chat_id BIGINT PRIMARY KEY,
@@ -113,10 +102,6 @@ await pool.query(`
       recurring BOOLEAN NOT NULL DEFAULT FALSE
     );
   `);
-  // Origin message_id so delayed alert triggers (fired later from the
-  // background checker, not from a live incoming message) can still
-  // reply-thread to the message that created them and ping the user.
-  await pool.query(`ALTER TABLE price_alerts ADD COLUMN IF NOT EXISTS message_id BIGINT;`);
 await pool.query(`
     CREATE TABLE IF NOT EXISTS holdings (
       id SERIAL PRIMARY KEY,
@@ -160,7 +145,14 @@ await pool.query(`
       UNIQUE(user_id, ticker)
     );
   `);
-  await pool.query(`ALTER TABLE dev_watches ADD COLUMN IF NOT EXISTS message_id BIGINT;`);
+  // Discord servers that want exchange-listing alerts posted in one channel
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS discord_listing_channels (
+      guild_id TEXT PRIMARY KEY,
+      channel_id TEXT NOT NULL,
+      created_at BIGINT NOT NULL
+    );
+  `);
   console.log('✅ Database tables ready');
 }
 
@@ -192,7 +184,14 @@ function getTodayKey() {
 }
 
 function isAdmin(userId) {
-  return String(userId) === String(myChatId);
+  const id = String(userId);
+  return id === String(myChatId) || (!!process.env.DISCORD_ADMIN_ID && id === String(process.env.DISCORD_ADMIN_ID));
+}
+
+// Telegram ids are < ~1e13; Discord snowflakes are ~1e18 (17-20 digits).
+// That gap lets us tell the platforms apart from the id alone — no extra DB columns needed.
+function isDiscordId(id) {
+  return /^\d{16,20}$/.test(String(id));
 }
 
 function fmt(n) {
@@ -218,7 +217,6 @@ async function fetchWithRetry(url, options = {}, retries = 2) {
     }
   }
 }
-
 
 // ─── SUBSCRIPTION / USAGE ────────────────────────────────────────────────────
 
@@ -268,15 +266,8 @@ async function getTokenContract(ticker) {
       { headers: { 'x-cg-demo-api-key': coingeckoKey } }
     );
     const searchData = await searchRes.json();
-    if (!searchRes.ok || searchData?.status?.error_code) {
-      console.error(`CoinGecko search returned an error for "${ticker}": HTTP ${searchRes.status} — ${JSON.stringify(searchData).slice(0, 200)}`);
-      return null;
-    }
     const coin = searchData?.coins?.find((c) => c.symbol.toUpperCase() === ticker.toUpperCase());
-    if (!coin) {
-      console.log(`CoinGecko: no coin matched symbol "${ticker}" (${searchData?.coins?.length || 0} results returned)`);
-      return null;
-    }
+    if (!coin) return null;
 
     const detailRes = await fetchWithRetry(
       `https://api.coingecko.com/api/v3/coins/${coin.id}`,
@@ -302,8 +293,7 @@ async function getTokenContract(ticker) {
     }
 
     if (candidates.length === 0) {
-      console.log(`CoinGecko: matched "${ticker}" (id=${coin.id}) but it has no usable contract platform data — falling back to DexScreener`);
-      return null;
+      return { chain: null, address: null, logoImage, totalSupply, coingeckoId };
     }
 
     if (candidates.length === 1) {
@@ -340,70 +330,28 @@ async function searchDexScreener(ticker) {
   try {
     const res = await fetchWithRetry(`https://api.dexscreener.com/latest/dex/search?q=${ticker}`);
     const data = await res.json();
-    if (!res.ok) {
-      console.error(`DexScreener search returned HTTP ${res.status} for "${ticker}"`);
-      return null;
-    }
     const pairs = data?.pairs || [];
+    const match = pairs.find((p) => p.baseToken?.symbol?.toUpperCase() === ticker.toUpperCase());
+    if (!match) return null;
     const chainMap = { ethereum: 'eth', bsc: 'bsc', solana: 'sol' };
-
-    // Among all pairs matching this exact symbol, only consider chains we
-    // actually support, then pick the highest-liquidity one — not just the
-    // first pair DexScreener happens to list. Taking the first match by API
-    // order was landing on obscure/unrelated tokens sharing the same ticker
-    // (e.g. a "PEPE" on some random unsupported chain) instead of the
-    // actual, highly-liquid real token.
-    const candidates = pairs.filter(
-      (p) => p.baseToken?.symbol?.toUpperCase() === ticker.toUpperCase() && chainMap[p.chainId]
-    );
-
-    if (candidates.length === 0) {
-      const symbolMatches = pairs.filter((p) => p.baseToken?.symbol?.toUpperCase() === ticker.toUpperCase());
-      if (symbolMatches.length === 0) {
-        console.log(`DexScreener: no pair matched symbol "${ticker}" (${pairs.length} pairs returned, symbols seen: ${pairs.slice(0, 5).map(p => p.baseToken?.symbol).join(', ')})`);
-      } else {
-        console.log(`DexScreener: ${symbolMatches.length} pair(s) matched "${ticker}" but none on a supported chain (chains seen: ${[...new Set(symbolMatches.map(p => p.chainId))].join(', ')})`);
-      }
-      return null;
-    }
-
-    const best = candidates.reduce((a, b) => ((b.liquidity?.usd || 0) > (a.liquidity?.usd || 0) ? b : a));
-    const chain = chainMap[best.chainId];
-    return { chain, address: best.baseToken.address, totalSupply: null, coingeckoId: null };
+    const chain = chainMap[match.chainId] || null;
+    if (!chain) return null;
+    return { chain, address: match.baseToken.address, totalSupply: null, coingeckoId: null };
   } catch (err) {
     console.error('DexScreener search failed:', err.message);
     return null;
   }
 }
 
-// Pulls a token ticker out of an exchange announcement title.
-// Different exchanges (and different announcement types on the same exchange)
-// format tickers in different ways, so we try each known pattern in order
-// until one matches:
-//   "Pepe (PEPE) Gets Listed on Bybit Spot"            -> parenthesis format
-//   "$GROVE is officially listed on Bybit Spot..."      -> dollar-sign format
-//   "OKX to list TAO/USDT (Bittensor) for spot trading" -> slash-pair format (OKX's most common pattern)
-// Returns null if none of the patterns match.
+// Pulls a ticker out of an exchange announcement title. Tried in order:
+//   1) "Pepe (PEPE)"       2) "$PEPE"       3) "PEPE/USDT" (or /USD, /USDC)
 function extractTicker(title) {
   const parenMatch = title.match(/\(([A-Z0-9]{2,10})\)/);
   if (parenMatch) return parenMatch[1];
-
   const dollarMatch = title.match(/\$([A-Z0-9]{2,10})\b/);
   if (dollarMatch) return dollarMatch[1];
-
-  // Matches the base asset in a pair like "TAO/USDT" or "TAO/USD" — takes
-  // the left-hand side only, since that's the newly listed token.
   const slashMatch = title.match(/\b([A-Z0-9]{2,10})\/(USDT|USD|USDC)\b/);
   if (slashMatch) return slashMatch[1];
-
-  // Matches a concatenated pair with no separator, e.g. "AEONUSDT" or
-  // "LYTEUSDT" — this is the actual format Bybit's listing titles use
-  // ("New listing: AEONUSDT Perpetual Contract..."), and without this
-  // pattern extraction silently failed for essentially every Bybit
-  // announcement, skipping the safety check entirely.
-  const concatMatch = title.match(/\b([A-Z0-9]{2,10})(USDT|USDC|USD)\b/);
-  if (concatMatch) return concatMatch[1];
-
   return null;
 }
 
@@ -561,7 +509,7 @@ function assessDevRisk(deployCount) {
 async function getEthTopHolders(address) {
   try {
     const res = await fetchWithRetry(
-      `https://api.etherscan.io/v2/api?chainid=1&module=token&action=tokenholderlist&contractaddress=${address}&page=1&offset=20&apikey=${etherscanKey}`
+      `https://api.etherscan.io/v2/api?chainid=1&module=token&action=tokenholderlist&contractaddress=${address}&page=1&offset=10&apikey=${etherscanKey}`
     );
     const data = await res.json();
     if (data.status === '1' && Array.isArray(data.result)) {
@@ -576,7 +524,7 @@ async function getEthTopHolders(address) {
 async function getBscTopHolders(address) {
   try {
     const res = await fetchWithRetry(
-      `https://api.etherscan.io/v2/api?chainid=56&module=token&action=tokenholderlist&contractaddress=${address}&page=1&offset=20&apikey=${etherscanKey}`
+      `https://api.etherscan.io/v2/api?chainid=56&module=token&action=tokenholderlist&contractaddress=${address}&page=1&offset=10&apikey=${etherscanKey}`
     );
     const data = await res.json();
     if (data.status === '1' && Array.isArray(data.result)) {
@@ -588,21 +536,24 @@ async function getBscTopHolders(address) {
   }
 }
 
+// Free holder source for Ethereum: Blockscout public API (no key needed).
+// BSC has no free equivalent, so it throws and /w reports "couldn't analyse".
 async function getTopHoldersMoralis(address, chain) {
-  if (!moralisKey) throw new Error('No Moralis API key');
-  const chainMap = { eth: 'eth', bsc: 'bsc', sol: 'solana' };
-  const res = await fetchWithRetry(
-    `https://deep-index.moralis.io/api/v2.2/erc20/${address}/owners?chain=${chainMap[chain] || chain}&limit=20`,
-    { headers: { 'X-API-Key': moralisKey, 'Accept': 'application/json' } }
-  );
+  if (chain !== 'eth') throw new Error('No free holder source for ' + chain);
+  const res = await fetchWithRetry(`https://eth.blockscout.com/api/v2/tokens/${address}/holders`, {
+    headers: { Accept: 'application/json' },
+  });
   const data = await res.json();
-  if (data.result && Array.isArray(data.result)) {
-    return data.result.map((h) => ({
-      address: h.owner_address || h.address,
-      balance: parseFloat(h.balance) / Math.pow(10, h.decimals || 18),
-    }));
+  if (Array.isArray(data?.items) && data.items.length > 0) {
+    return data.items.slice(0, 10).map((h) => {
+      const decimals = parseInt(h.token?.decimals ?? data.token?.decimals ?? 18);
+      return {
+        address: h.address?.hash || h.address,
+        balance: parseFloat(h.value) / Math.pow(10, isNaN(decimals) ? 18 : decimals),
+      };
+    });
   }
-  throw new Error('No Moralis data');
+  throw new Error('No Blockscout holder data');
 }
 
 async function getSolTopHolders(address) {
@@ -632,10 +583,7 @@ async function getSolTopHolders(address) {
     }
 
     if (!data.result?.value?.length) throw new Error('No Solana holder data returned');
-    // Helius's getTokenLargestAccounts caps at 20 by default, which works
-    // in our favor here — slice(0, 20) rather than 10 so post-filtering
-    // (burn/LP addresses) still leaves a full top-10 list.
-    return data.result.value.slice(0, 20).map((a) => ({
+    return data.result.value.slice(0, 10).map((a) => ({
       address: a.address,
       balance: parseFloat(a.uiAmountString || a.uiAmount || 0),
     }));
@@ -711,28 +659,6 @@ async function getTotalSupply(chain, address, ticker) {
   return null;
 }
 
-// Known burn addresses across chains — tokens sent here are permanently
-// destroyed, not held by anyone. Counting these toward "concentration risk"
-// is backwards: a token with 40% burned is safer, not riskier.
-const BURN_ADDRESSES = new Set([
-  '0x0000000000000000000000000000000000dead',
-  '0x0000000000000000000000000000000000d34d',
-  '0x0000000000000000000000000000000000000000',
-  '1nc1nerator11111111111111111111111111111',
-]);
-
-async function getLpPairAddresses(address) {
-  try {
-    const res = await fetchWithRetry(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
-    const data = await res.json();
-    const pairs = data?.pairs || [];
-    return new Set(pairs.map((p) => p.pairAddress?.toLowerCase()).filter(Boolean));
-  } catch (err) {
-    console.error('Failed to fetch LP pair addresses:', err.message);
-    return new Set();
-  }
-}
-
 async function getTopHoldersWithPercentage(chain, address, ticker) {
   let holders;
   switch (chain) {
@@ -750,28 +676,9 @@ async function getTopHoldersWithPercentage(chain, address, ticker) {
   }
 
   let totalSupply = await getTotalSupply(chain, address, ticker);
-  let supplyIsEstimated = false;
-  if (!totalSupply) {
-    console.log(`getTotalSupply failed for ${ticker} (${chain}) — falling back to sum of top ${holders.length} fetched holders as an approximation. This UNDERSTATES real supply if the token has holders beyond what was fetched, which inflates the reported concentration %.`);
-    totalSupply = holders.reduce((s, h) => s + h.balance, 0);
-    supplyIsEstimated = true;
-  }
+  if (!totalSupply) totalSupply = holders.reduce((s, h) => s + h.balance, 0);
 
-  // Exclude burn addresses and the token's own LP pool(s) from the
-  // "holder" list entirely — these aren't whales and shouldn't factor
-  // into manipulation-risk scoring. totalSupply is left as-is (their
-  // tokens still count toward supply, just not toward "who could dump").
-  const lpAddresses = await getLpPairAddresses(address);
-  const filteredHolders = holders
-    .filter((h) => {
-      const lower = h.address.toLowerCase();
-      return !BURN_ADDRESSES.has(lower) && !lpAddresses.has(lower);
-    })
-    .slice(0, 10);
-
-  console.log(`${ticker} (${chain}): fetched ${holders.length} raw holders, ${filteredHolders.length} remain after burn/LP filtering, totalSupply=${totalSupply}`);
-
-  const holdersWithPct = filteredHolders.map((h) => ({
+  const holdersWithPct = holders.map((h) => ({
     address: h.address,
     balance: h.balance,
     percentage: (h.balance / totalSupply) * 100,
@@ -781,30 +688,13 @@ async function getTopHoldersWithPercentage(chain, address, ticker) {
     holders: holdersWithPct,
     top10Total: holdersWithPct.reduce((s, h) => s + h.percentage, 0),
     totalSupply,
-    supplyIsEstimated,
   };
 }
 
-function assessConcentrationRisk(top10Pct, chain, topHolderPct) {
-  const level = top10Pct >= 70 ? '🔴 HIGH RISK' : top10Pct >= 40 ? '🟡 MID RISK' : '🟢 LOW RISK';
-  let description = top10Pct >= 70
-    ? 'Extreme concentration — high manipulation risk.'
-    : top10Pct >= 40
-      ? 'Significant concentration — exercise caution.'
-      : 'Supply is well distributed.';
-
-  // On Solana, a pool/bonding-curve's tokens sit in a token account
-  // controlled by a pool-specific derived address, which has no reliable
-  // way to be matched against a static list the way EVM liquidity pool
-  // contracts can be — so unlike ETH/BSC, this single-wallet-dominance
-  // pattern here often means "this is the pool," not "one whale controls
-  // the token." Flagging that honestly rather than asserting a risk level
-  // we can't actually confirm on this chain.
-  if (chain === 'sol' && topHolderPct >= 90) {
-    description += ' ⚠️ Note: on Solana, one wallet holding this much is very often the liquidity pool or bonding curve itself (normal for freshly launched tokens), not necessarily a single person — this can\'t be reliably distinguished from a real whale on Solana yet, so verify manually before treating this as a red flag.';
-  }
-
-  return { level, description };
+function assessConcentrationRisk(top10Pct) {
+  if (top10Pct >= 70) return { level: '🔴 HIGH RISK', description: 'Extreme concentration — high manipulation risk.' };
+  if (top10Pct >= 40) return { level: '🟡 MID RISK',  description: 'Significant concentration — exercise caution.' };
+  return                     { level: '🟢 LOW RISK',  description: 'Supply is well distributed.' };
 }
 
 // ─── CHART ────────────────────────────────────────────────────────────────────
@@ -957,40 +847,22 @@ async function fetchTrending() {
     console.error('CMC trending fetch failed:', err.message);
   }
 
-  // Fallback: CoinGecko — free (same key already used elsewhere in this
-  // file). Replaced the old CoinCap fallback because api.coincap.io's free
-  // v2 API no longer exists at all (the domain stopped resolving in 2025;
-  // CoinCap moved to a paid v3 product), so that fallback was silently
-  // dead — meaning if CMC ever failed (like the ongoing quota issue),
-  // /trending had no working fallback at all.
-  //
-  // CoinGecko's /coins/markets doesn't support sorting directly by 24h %
-  // change, so we pull the top 100 by market cap (with 24h change data
-  // included) and sort client-side instead. This also has a side benefit:
-  // restricting to top-100-by-market-cap coins first avoids surfacing
-  // illiquid/pump-and-dump micro-caps that a pure "sort everything by 24h
-  // change" approach tends to produce.
+  // Fallback: CoinCap — free, no key needed
   try {
-    const res = await fetchWithRetry(
-      'https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=100&page=1&price_change_percentage=24h',
-      { headers: { 'x-cg-demo-api-key': coingeckoKey } }
-    );
+    const res = await fetch('https://api.coincap.io/v2/assets?limit=10&sort=changePercent24Hr&direction=desc');
     const data = await res.json();
-    if (!Array.isArray(data) || data.length === 0) throw new Error(`No CoinGecko data: ${JSON.stringify(data).slice(0, 150)}`);
-    const sorted = [...data].sort(
-      (a, b) => (b.price_change_percentage_24h ?? -Infinity) - (a.price_change_percentage_24h ?? -Infinity)
-    );
-    trendingCache = sorted.slice(0, 10).map((c, i) => ({
+    if (!data?.data?.length) throw new Error('No CoinCap data');
+    trendingCache = data.data.map((c, i) => ({
       rank:      i + 1,
       name:      c.name,
-      symbol:    c.symbol?.toUpperCase(),
-      change24h: c.price_change_percentage_24h,
-      price:     c.current_price,
+      symbol:    c.symbol,
+      change24h: parseFloat(c.changePercent24Hr || 0),
+      price:     parseFloat(c.priceUsd || 0),
     }));
     trendingCacheTime = Date.now();
     return trendingCache;
   } catch (err) {
-    console.error('CoinGecko trending fallback failed:', err.message);
+    console.error('CoinCap trending fallback failed:', err.message);
     return trendingCache || null;
   }
 }
@@ -1140,112 +1012,96 @@ async function runSafetyCheckByTitle(title) {
   };
 }
 
-// ─── UNIVERSAL MESSAGE STYLING ─────────────────────────────────────────────
-//
-// Every message CoinRadar sends — results, confirmations, loading messages,
-// errors, everything — gets wrapped in the same bordered/monospace look so
-// the bot's replies are visually distinct from a normal Telegram chat.
-//
-// What Telegram's Bot API actually supports (and doesn't):
-//   - NO custom fonts. NO CSS-style borders. The platform doesn't expose
-//     either of those to bots — no formatting trick can fake them.
-//   - <code> DOES render in a real monospace font, which reads as visually
-//     different from Telegram's normal proportional text.
-//   - <blockquote> DOES render as a block with a vertical accent line down
-//     the left edge — the closest real equivalent Telegram has to a "border".
-// This is built on those two real features: a monospace box-drawn header,
-// then the message body inside a blockquote.
-//
-// Because the rest of the file was written using Markdown-style formatting
-// (*bold*, `code`, etc.) before this system existed, wrapBoxed() below also
-// converts basic Markdown to the HTML tags this box format requires, so
-// every existing message keeps working without having to rewrite all ~100
-// send calls throughout the file by hand.
+// ─── MESSAGE STYLING (universal CoinRadar "box") ──────────────────────────────
+// Telegram bots cannot change fonts or draw CSS borders, so the box is built from
+// a monospace <code> header/footer (Unicode box-drawing characters) wrapped around
+// a <blockquote> body (Telegram renders a coloured side-bar next to it).
+// Every message the bot sends goes through wrapBoxed() via the sendMessage patch below.
 
-// Escapes characters that would otherwise break Telegram's HTML parser.
-function escapeHtml(text) {
-  return String(text)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+function escapeHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-// Converts the small subset of Markdown used throughout this file
-// (*bold*, `code`) into the equivalent HTML tags. Runs AFTER escapeHtml
-// on the raw text is not correct here — instead we escape first, then
-// reintroduce only the specific tags we generate ourselves, so any HTML-like
-// text the user or an API response contains can't be misinterpreted as a tag.
+// Converts Telegram-legacy-Markdown fragments (*bold*, _italic_, `code`, [t](url))
+// plus bare URLs into Telegram HTML. Code spans and links are stashed first so
+// underscores/asterisks inside URLs or code are never mistaken for formatting.
 function markdownFragmentsToHtml(text) {
-  let result = escapeHtml(text);
-  result = result.replace(/\*(.+?)\*/g, '<b>$1</b>');   // *bold* -> <b>bold</b>
-  result = result.replace(/`(.+?)`/g, '<code>$1</code>'); // `code` -> <code>code</code>
-  result = result.replace(/_(.+?)_/g, '<i>$1</i>');      // _italic_ -> <i>italic</i>
-  return result;
+  const stash = [];
+  const keep = (html) => { stash.push(html); return `\u0000${stash.length - 1}\u0000`; };
+  let t = String(text)
+    .replace(/```([\s\S]*?)```/g, (_, c) => keep(`<pre>${escapeHtml(c.trim())}</pre>`))
+    .replace(/`([^`\n]+)`/g, (_, c) => keep(`<code>${escapeHtml(c)}</code>`))
+    .replace(/\[([^\]\n]+)\]\((https?:[^)\s]+)\)/g, (_, l, u) => keep(`<a href="${escapeHtml(u)}">${escapeHtml(l)}</a>`))
+    .replace(/https?:\/\/[^\s<>()]+/g, (u) => keep(`<a href="${escapeHtml(u)}">${escapeHtml(u)}</a>`));
+  t = escapeHtml(t)
+    .replace(/\*([^*\n]+)\*/g, (_, a) => keep(`<b>${a}</b>`))
+    .replace(/(^|[^\w])_([^_\n]+)_(?=[^\w]|$)/g, (_, p, a) => p + keep(`<i>${a}</i>`));
+  while (/\u0000\d+\u0000/.test(t)) t = t.replace(/\u0000(\d+)\u0000/g, (_, i) => stash[Number(i)]);
+  return t;
 }
 
-// The single shared box header. Kept identical across every message type
-// per design — one universal look, not a different accent per category.
-const BOX_TOP    = '┏━━━━━━━━━━━━━━━━━━━━━┓';
-const BOX_BOTTOM = '┗━━━━━━━━━━━━━━━━━━━━━┛';
+const BOX_WIDTH = 28;
+function boxTop(label) {
+  const mid = `┏━━ ${label} `;
+  return mid + '━'.repeat(Math.max(2, BOX_WIDTH - 1 - mid.length)) + '┓';
+}
+const BOX_BOTTOM = '┗' + '━'.repeat(BOX_WIDTH - 2) + '┛';
 
-// Wraps any message text in the bordered/monospace box. `label` is a short
-// all-caps line shown inside the header bar (e.g. "COINRADAR", "ALERT",
-// "SAFETY CHECK") — kept generic and reused everywhere rather than a
-// per-command custom header, per the "one universal style" design choice.
-// The "COINRADAR" header bar has been removed globally — every message
-// funnels through this one function (via the universal sendMessage/
-// sendPhoto wrapper below), so this single change drops it everywhere at
-// once, including listing alerts, without touching individual call sites.
-// `label` is kept as a no-op parameter so existing call sites (which still
-// pass e.g. 'NEW LISTING ALERT') don't need to be edited.
-function wrapBoxed(text, _label = 'COINRADAR') {
-  const body = markdownFragmentsToHtml(text);
-  return `<blockquote>${body}</blockquote>`;
+// bodyIsHtml=false → body is Markdown-ish text (converted); true → already HTML.
+function wrapBoxed(text, label = 'COINRADAR', bodyIsHtml = false) {
+  const body = bodyIsHtml ? text : markdownFragmentsToHtml(text);
+  return `<code>${boxTop(label)}</code>\n<blockquote>${body}</blockquote>\n<code>${BOX_BOTTOM}</code>`;
 }
 
-// Kept as an alias for clarity at call sites that never had a header to
-// begin with (like /p) — functionally identical to wrapBoxed() now.
-function wrapBoxedNoHeader(text) {
-  const body = markdownFragmentsToHtml(text);
-  return `<blockquote>${body}</blockquote>`;
+// Plain-text (no parse_mode) messages must be HTML-escaped but NOT markdown-converted
+// so literal "*" or "_" characters in them stay literal.
+function wrapPlainBoxed(text) {
+  return `<code>${boxTop('COINRADAR')}</code>\n<blockquote>${escapeHtml(text).replace(/(https?:\/\/[^\s<>()]+)/g, '<a href="$1">$1</a>')}</blockquote>\n<code>${BOX_BOTTOM}</code>`;
 }
 
-// Coin logo images are intentionally NOT sent for price/safety-style
-// commands (see isChartImage() and the sendPhoto wrapper below). Telegram
-// renders photo bubbles at close to full chat width regardless of the
-// image's actual pixel dimensions — only height responds to aspect ratio —
-// so there was no way to make these visually smaller/narrower without
-// dropping them. Charts (candlestick/TradingView snapshots) are real data
-// visualizations and are still sent as photos.
-function isChartImage(photo) {
-  if (typeof photo !== 'string') return true; // Buffers are always chart snapshots here
-  return /quickchart\.io|chart-img|tradingview/i.test(photo);
+// Listing alerts get their own header so they stand out from regular replies.
+function formatListingAlert(exchange, title, url, safetyText) {
+  let body = `🚨 <b>NEW ${escapeHtml(exchange.toUpperCase())} LISTING</b>\n\n${escapeHtml(title)}\n\n` +
+    (url ? `🔗 <a href="${escapeHtml(url)}">View announcement</a>` : '🔗 No link available');
+  if (safetyText) body += `\n\n${markdownFragmentsToHtml(safetyText)}`;
+  return wrapBoxed(body, 'LISTING ALERT', true);
 }
 
-// Listing alerts have their own shape (exchange name, title, url, safety
-// text) so they get a thin wrapper around wrapBoxed rather than reusing its
-// generic single-text-block signature directly.
-function formatListingAlert(exchangeName, title, url, safetyText) {
-  const bodyText = `*${exchangeName}*\n${title}${safetyText ? `\n\n${safetyText}` : ''}`;
-  return wrapBoxed(bodyText, 'NEW LISTING ALERT');
+// ─── LISTING DELIVERY ─────────────────────────────────────────────────────────
+
+// Sends one listing alert to one target (Telegram chat/user OR Discord channel).
+async function sendListingAlert(targetId, exchange, title, url, safetyResult) {
+  if (isDiscordId(targetId)) {
+    const text = `🚨 *New ${exchange} Listing*\n\n${title}\n\n🔗 ${url || 'No link available'}` +
+      (safetyResult ? `\n\n${safetyResult.text}` : '');
+    if (safetyResult?.image) return bot.sendPhoto(targetId, safetyResult.image, { caption: text, parse_mode: 'Markdown' });
+    return bot.sendMessage(targetId, text, { parse_mode: 'Markdown' });
+  }
+  const html = formatListingAlert(exchange, title, url, safetyResult?.text);
+  if (safetyResult?.image) return bot.sendPhoto(targetId, safetyResult.image, { caption: html, parse_mode: 'HTML' });
+  return bot.sendMessage(targetId, html, { parse_mode: 'HTML' });
 }
 
-
+// Everyone who should receive a listing alert: active paid users, active paid chats,
+// the admin, and every Discord channel configured with /setlistings.
 async function broadcastToSubscribers(sendFn) {
   try {
     const now = Date.now();
     const users = await pool.query('SELECT user_id FROM paid_users WHERE expiry > $1', [now]);
     const chats = await pool.query('SELECT chat_id FROM paid_chats WHERE expiry > $1', [now]);
+    const dc    = await pool.query('SELECT channel_id FROM discord_listing_channels');
 
+    // Strings, never Number(): Discord snowflakes exceed JS's safe-integer range.
     const targets = new Set();
-    for (const row of users.rows) targets.add(Number(row.user_id));
-    for (const row of chats.rows) targets.add(Number(row.chat_id));
-    if (myChatId) targets.add(Number(myChatId));
+    for (const row of users.rows) if (!isDiscordId(row.user_id)) targets.add(String(row.user_id)); // no DM spam on Discord
+    for (const row of chats.rows) if (!isDiscordId(row.chat_id)) targets.add(String(row.chat_id));
+    if (myChatId) targets.add(String(myChatId));
+    for (const row of dc.rows) targets.add(String(row.channel_id));
 
     for (const targetId of targets) {
       try {
         await sendFn(targetId);
-        await new Promise((r) => setTimeout(r, 40)); // respect Telegram rate limits
+        await new Promise((r) => setTimeout(r, 40)); // stay under Telegram rate limits
       } catch (err) {
         console.error(`Broadcast failed for ${targetId}:`, err.message);
       }
@@ -1255,38 +1111,29 @@ async function broadcastToSubscribers(sendFn) {
   }
 }
 
-// Polls Bybit's public announcements feed every 5 minutes (see setInterval
-// near the bottom of this file) looking for genuinely new token listings.
+// ─── BYBIT LISTING MONITOR ────────────────────────────────────────────────────
+// Polls Bybit's public announcements feed every 5 min. First run only "primes" the
+// seen-list (so you don't get 20 old alerts on a fresh DB). After that, any new
+// announcement whose title matches a listing keyword is broadcast with an automatic
+// safety check on the extracted ticker.
 //
-// How it avoids re-alerting on the same listing every poll:
-//   1. Every announcement ID we've ever seen is stored in the
-//      `seen_announcements` table.
-//   2. On the very first run (empty table), we mark everything currently on
-//      the feed as "seen" WITHOUT alerting — otherwise the bot would blast
-//      out 20 alerts for listings that happened before it ever started.
-//   3. On every run after that, only IDs not already in the table trigger
-//      an alert, and immediately get marked seen so they never fire twice.
-//
-// Filtering: Bybit's feed mixes real listings in with promos, competitions,
-// and maintenance notices, so we only act on titles matching listingKeywords.
-//
-// EXCLUDE_KEYWORDS is checked first and short-circuits to "not a listing"
-// regardless of what else matches — this exists because broad inclusion
-// keywords like "perpetual contract" or "list" also match totally
-// unrelated announcements about EXISTING listings (e.g. "TradFi Perpetual
-// Contracts: Leverage Adjustments" contains "perpetual contract" but is a
-// parameter change, not a new listing; "OKX to delist X" contains "list").
-const LISTING_EXCLUDE_KEYWORDS = [
-  'delist', 'delisting', 'suspend', 'suspension', 'maintenance',
-  'adjustment', 'migration', 'compensation', 'reminder', 'risk warning',
-  'clarification', 'correction', 'update on', 'fee schedule',
-  'leverage adjustment', 'trading fee',
-];
+// Diagnostics: bybitStats is shown in the admin /status command — if `HTTP` is 403
+// the host's IP is being blocked by Bybit (a hosting problem, not a code problem).
 
-function isGenuineListingAnnouncement(title, inclusionKeywords) {
-  const lower = (title || '').toLowerCase();
-  if (LISTING_EXCLUDE_KEYWORDS.some((kw) => lower.includes(kw))) return false;
-  return inclusionKeywords.some((kw) => lower.includes(kw));
+const bybitStats = { lastRun: null, http: null, items: 0, matched: 0, error: null };
+const okxStats   = { lastRun: null, http: null, items: 0, matched: 0, error: null };
+
+const bybitListingKeywords = [
+  'listing', 'listed', 'will list', 'lists ', 'new spot', 'new listing', 'innovation zone',
+  'perpetual', 'perpetual contract', 'launchpool', 'megadrop', 'pre-market', 'pre-listing',
+  'spot trading pair', 'trading pairs', 'now available', 'now live', 'new crypto',
+];
+const okxListingKeywords = ['list', 'launch', 'now live', 'now open', 'now available', 'new trading pair'];
+
+function titleLooksLikeListing(title, keywords) {
+  const t = (title || '').toLowerCase();
+  if (t.includes('delist')) return false; // "delisting" contains "listing" — never alert on those
+  return keywords.some((k) => t.includes(k));
 }
 
 async function checkBybitListings() {
@@ -1295,106 +1142,74 @@ async function checkBybitListings() {
       'https://api.bybit.com/v5/announcements/index?locale=en-US&limit=20',
       { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; CoinRadarBot/1.0)', 'Accept': 'application/json' } }
     );
+    bybitStats.http = res.status;
     const rawText = await res.text();
     let data;
     try { data = JSON.parse(rawText); }
-    catch { console.error('Non-JSON from Bybit:', rawText.slice(0, 200)); return; }
+    catch {
+      bybitStats.error = `Non-JSON (HTTP ${res.status})`;
+      console.error('Non-JSON from Bybit:', res.status, rawText.slice(0, 200));
+      return;
+    }
 
     const items = data?.result?.list || [];
     lastCheckTime = Date.now();
+    bybitStats.lastRun = lastCheckTime;
+    bybitStats.items = items.length;
+    bybitStats.error = items.length === 0 ? `Empty list (retCode ${data?.retCode})` : null;
 
     const alreadySeen = await countSeenAnnouncements();
     if (alreadySeen === 0) {
-      for (const item of items) {
-        const id = item.id || item.url || item.title;
-        if (id) await markAnnouncementSeen(id);
-      }
+      for (const item of items) if (item.id) await markAnnouncementSeen(item.id);
       console.log(`Initialized with ${items.length} existing Bybit announcements.`);
       return;
     }
 
+    let matched = 0;
     for (const item of items) {
-      const id = item.id || item.url || item.title;
-      if (!id) continue;
-      // "perpetual contract" was removed from this list — it matched ANY
-      // announcement mentioning perpetuals at all (leverage changes, fee
-      // updates, etc.), not just new listings. "listing" alone already
-      // catches every genuine "New listing: X Perpetual Contract..." title.
-      const listingKeywords = [
-        'listing', 'listed', 'will list', 'to list',
-        'new spot', 'innovation zone',
-        'new asset', 'launch', 'now live', 'now open', 'now available',
-      ];
-      const isListing = isGenuineListingAnnouncement(item.title, listingKeywords);
-      if (!isListing) continue;
-      if (await hasSeenAnnouncement(id)) continue;
-      await markAnnouncementSeen(id);
+      if (!item.id) continue;
+      if (!titleLooksLikeListing(item.title, bybitListingKeywords)) continue;
+      matched++;
+      if (await hasSeenAnnouncement(item.id)) continue;
+      await markAnnouncementSeen(item.id);
       listingsSeenToday++;
 
-      // Run the safety check based on the ticker extracted from the title.
-      // If extraction or the on-chain lookup fails, safetyResult is null and
-      // the alert still sends — just without a safety section attached.
       const safetyResult = await runSafetyCheckByTitle(item.title);
-
-      // Use the bordered/monospace formatting (see formatListingAlert) so
-      // listing alerts are visually distinct from normal bot replies.
-      const caption = formatListingAlert('Bybit', item.title, item.url, safetyResult?.text);
-
-      await broadcastToSubscribers(async (targetId) => {
-        if (safetyResult?.image) await bot.sendPhoto(targetId, safetyResult.image, { caption, parse_mode: 'HTML', forceImage: true });
-        else await bot.sendMessage(targetId, caption, { parse_mode: 'HTML' });
-      });
-      console.log(`New listing: ${item.title}`);
+      await broadcastToSubscribers((targetId) =>
+        sendListingAlert(targetId, 'Bybit', item.title, item.url, safetyResult));
+      console.log(`New Bybit listing: ${item.title}`);
     }
+    bybitStats.matched = matched;
   } catch (err) {
+    bybitStats.error = err.message;
     console.error('Bybit check error:', err.message);
   }
 }
-// Same pattern as checkBybitListings above, but against OKX's public
-// announcements API. OKX doesn't give each announcement a clean numeric ID
-// the way Bybit does, so we use the publish timestamp (pTime) — or the
-// title itself as a last resort — as the dedup key instead, stored in its
-// own `seen_okx_announcements` table (kept separate from Bybit's so IDs
-// from the two exchanges can never collide with each other).
+
+// ─── OKX LISTING MONITOR ──────────────────────────────────────────────────────
+// Same flow as Bybit, against OKX's announcements API (new-listings category).
+
 async function checkOkxListings() {
   try {
-    // Explicit timeout — node-fetch v2 has no default one, and a request
-    // that OKX's servers silently drop/never respond to (not uncommon for
-    // bot-protected endpoints hit from a cloud host's IP) would otherwise
-    // hang this await forever: never resolving, never rejecting, never
-    // reaching the catch block below, and never logging anything at all —
-    // which is exactly what total silence in the logs looked like.
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
-    let res;
-    try {
-      res = await fetch(
-        'https://www.okx.com/api/v5/support/announcements?annType=announcements-new-listings',
-        {
-          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; CoinRadarBot/1.0)', 'Accept': 'application/json' },
-          signal: controller.signal,
-        }
-      );
-    } finally {
-      clearTimeout(timeout);
-    }
+    const res = await fetch(
+      'https://www.okx.com/api/v5/support/announcements?annType=announcements-new-listings',
+      { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; CoinRadarBot/1.0)', 'Accept': 'application/json' } }
+    );
+    okxStats.http = res.status;
     const rawText = await res.text();
-    if (!res.ok) {
-      console.error(`OKX check error: HTTP ${res.status} — ${rawText.slice(0, 200)}`);
-      return;
-    }
     let data;
     try { data = JSON.parse(rawText); }
-    catch { console.error('Non-JSON from OKX:', rawText.slice(0, 200)); return; }
-
-    const items = data?.data?.[0]?.details || data?.data || [];
-    if (!Array.isArray(items) || items.length === 0) {
-      // Log the actual response shape once so we can see exactly why —
-      // wrong annType, changed response schema, empty feed, etc. — instead
-      // of this failing completely silently every single cycle.
-      console.error('OKX check: no items parsed from response. Raw shape:', JSON.stringify(data).slice(0, 300));
+    catch {
+      okxStats.error = `Non-JSON (HTTP ${res.status})`;
+      console.error('Non-JSON from OKX:', res.status, rawText.slice(0, 200));
       return;
     }
+
+    const items = data?.data?.[0]?.details || data?.data || [];
+    okxStats.lastRun = Date.now();
+    if (!Array.isArray(items) || items.length === 0) { okxStats.error = 'Empty list'; return; }
+    okxStats.items = items.length;
+    okxStats.error = null;
 
     const alreadySeen = await countSeenOkxAnnouncements();
     if (alreadySeen === 0) {
@@ -1406,36 +1221,24 @@ async function checkOkxListings() {
       return;
     }
 
+    let matched = 0;
     for (const item of items) {
       const id = item.pTime || item.title;
       if (!id) continue;
-      // OKX's announcement titles are fairly consistent ("OKX to list X for
-      // spot trading" / "OKX will launch X for spot trading"). Exclusion
-      // check above handles "delist" containing "list" as a substring.
-      const okxListingKeywords = ['list', 'launch', 'now live', 'now open', 'now available'];
-      const isListing = isGenuineListingAnnouncement(item.title, okxListingKeywords);
-      if (!isListing) continue;
+      if (!titleLooksLikeListing(item.title, okxListingKeywords)) continue;
+      matched++;
       if (await hasSeenOkxAnnouncement(id)) continue;
       await markOkxAnnouncementSeen(id);
 
-      // Same safety-check + distinct-formatting treatment as Bybit above —
-      // kept identical between the two so alerts feel consistent regardless
-      // of which exchange triggered them.
       const safetyResult = await runSafetyCheckByTitle(item.title);
-      const caption = formatListingAlert('OKX', item.title, item.url, safetyResult?.text);
-
-      await broadcastToSubscribers(async (targetId) => {
-        if (safetyResult?.image) await bot.sendPhoto(targetId, safetyResult.image, { caption, parse_mode: 'HTML', forceImage: true });
-        else await bot.sendMessage(targetId, caption, { parse_mode: 'HTML' });
-      });
+      await broadcastToSubscribers((targetId) =>
+        sendListingAlert(targetId, 'OKX', item.title, item.url, safetyResult));
       console.log(`New OKX listing: ${item.title}`);
     }
+    okxStats.matched = matched;
   } catch (err) {
-    if (err.name === 'AbortError') {
-      console.error('OKX check error: request timed out after 10s (OKX likely not responding to this server)');
-    } else {
-      console.error('OKX check error:', err.message);
-    }
+    okxStats.error = err.message;
+    console.error('OKX check error:', err.message);
   }
 }
 
@@ -1443,151 +1246,46 @@ async function checkOkxListings() {
 
 const bot = new TelegramBot(token, { polling: true });
 
-// ─── SELF-HEALING FOR STUCK POLLING ────────────────────────────────────────
-//
-// node-telegram-bot-api's long-polling loop can die silently — most often
-// after a 409 Conflict (another instance's getUpdates request briefly
-// overlapping during a redeploy) — without crashing the rest of the Node
-// process. Every other setInterval-based background loop (price alerts,
-// listing checkers) keeps running fine, so the app still shows "Live" and
-// looks healthy from the outside, but it stops receiving ANY Telegram
-// messages at all until the whole process restarts. The library has no
-// built-in recovery from this.
-//
-// Fix: track consecutive polling errors, and if they don't clear up within
-// a short window, deliberately crash the process so Render's (or
-// Railway's) process supervisor restarts it fresh and polling comes back
-// up clean. A brief restart is much better than staying silently "alive
-// but deaf" indefinitely.
-let pollingErrorCount = 0;
-let pollingErrorResetTimer = null;
-
-bot.on('polling_error', (err) => {
-  console.error('[polling_error]', err.code, err.message);
-  pollingErrorCount++;
-
-  // A single 409 is fairly normal right after a redeploy (brief overlap
-  // with the old instance shutting down) — only restart if errors keep
-  // happening, meaning it's genuinely stuck rather than self-resolving.
-  if (pollingErrorCount >= 5) {
-    console.error(`⚠️ ${pollingErrorCount} consecutive polling errors — restarting process to recover.`);
-    process.exit(1);
-  }
-
-  // Reset the counter if things go quiet for a while, so an old isolated
-  // error from hours ago doesn't count toward triggering a restart now.
-  clearTimeout(pollingErrorResetTimer);
-  pollingErrorResetTimer = setTimeout(() => { pollingErrorCount = 0; }, 2 * 60 * 1000);
-});
-
-// ─── AUTO REPLY-THREADING ──────────────────────────────────────────────────
-//
-// Every response the bot sends should reply-thread (Telegram's native
-// "reply to" feature) to whichever incoming message triggered it. This is
-// what actually pings the user — a plain "@username" written into message
-// text is NOT a real mention entity and never notifies anyone, but a
-// Telegram reply always notifies the author of the message being replied
-// to (assuming they haven't muted the chat). This matters most for
-// commands like /c or /chart where the real result comes some seconds
-// after the "Fetching..." message — without threading, that delayed
-// result is just an unlinked message the user can easily miss.
-//
-// IMPORTANT: this used to be implemented by wrapping bot.emit() for the
-// 'message' event, on the assumption that onText() handlers were dispatched
-// through that event. They are NOT — node-telegram-bot-api's onText() just
-// pushes {regexp, callback} into an internal array, and processUpdate()
-// calls matching callbacks directly, as a completely separate step AFTER
-// (not nested inside) its emit('message', ...) call. So the previous
-// version never actually wrapped any command handler and silently did
-// nothing. The fix is to wrap onText() itself, since that's the actual
-// dispatch path every command in this file goes through.
-const messageReplyContext = new AsyncLocalStorage();
-const originalOnText = bot.onText.bind(bot);
-bot.onText = function (regexp, callback) {
-  return originalOnText(regexp, (msg, match) => {
-    return messageReplyContext.run(msg, () => callback(msg, match));
-  });
-};
-
-// known_users tracking rides on the real 'message' event, which IS emitted
-// normally by the library (it's onText specifically that skips it) — this
-// part always worked correctly.
-bot.on('message', (msg) => {
-  if (msg.from?.id) recordKnownUser(msg);
-});
-
-// Fire-and-forget upsert — never blocks message handling, and a failure
-// here shouldn't break the bot, just gets logged.
-function recordKnownUser(msg) {
-  const userId = msg.from.id;
-  const username = msg.from.username ? `@${msg.from.username}` : (msg.from.first_name || null);
-  const now = Date.now();
-  pool.query(
-    `INSERT INTO known_users (user_id, chat_id, username, first_seen, last_seen)
-     VALUES ($1, $2, $3, $4, $4)
-     ON CONFLICT (user_id) DO UPDATE SET chat_id = $2, username = $3, last_seen = $4`,
-    [userId, msg.chat.id, username, now]
-  ).catch((err) => console.error('recordKnownUser error:', err.message));
-}
-
-// ─── APPLY BOXED STYLING TO EVERY MESSAGE, EVERYWHERE ─────────────────────
-//
-// Rather than editing all ~100 bot.sendMessage/bot.sendPhoto calls scattered
-// throughout this file by hand (error-prone, easy to miss one), we wrap the
-// two methods themselves right here, once. From this point on, EVERY call
-// to bot.sendMessage(...) or bot.sendPhoto(...) anywhere below this line —
-// results, confirmations, loading messages, errors, everything — is
-// automatically boxed before it goes out. Individual call sites don't need
-// to know this is happening; they just call bot.sendMessage(chatId, text)
-// exactly as before.
-//
-// We intentionally do NOT box messages that already set their own
-// parse_mode to 'HTML' with pre-built markup (like the listing alerts,
-// which build their own box via formatListingAlert) — otherwise they'd end
-// up double-boxed.
+// ─── UNIVERSAL STYLE + DISCORD ROUTING (monkey-patch) ─────────────────────────
+// Every bot.sendMessage / bot.sendPhoto in this file passes through here, so one
+// place controls the look on both platforms:
+//   • Discord ids  → rendered as embeds by the Discord layer
+//   • parse_mode 'HTML' → caller already built the box (listing alerts) — left alone
+//   • everything else → wrapped in the CoinRadar box
 const originalSendMessage = bot.sendMessage.bind(bot);
 const originalSendPhoto   = bot.sendPhoto.bind(bot);
 
-// Adds reply_to_message_id from the current async context, unless the
-// call site already set one explicitly, or the target chat isn't the
-// same chat the triggering message came from (e.g. an admin notification
-// fired while handling someone else's command — can't reply across chats).
-function withAutoReply(chatId, options) {
-  if (options.reply_to_message_id !== undefined) return options;
-  const currentMsg = messageReplyContext.getStore();
-  if (!currentMsg || String(currentMsg.chat.id) !== String(chatId)) return options;
-  return {
-    ...options,
-    reply_to_message_id: currentMsg.message_id,
-    allow_sending_without_reply: true, // don't fail if original got deleted
-  };
-}
-
 bot.sendMessage = function (chatId, text, options = {}) {
-  const alreadyBoxed = options.parse_mode === 'HTML';
-  const finalText = alreadyBoxed ? text : wrapBoxed(text);
-  const finalOptions = withAutoReply(chatId, { ...options, parse_mode: 'HTML' });
-  return originalSendMessage(chatId, finalText, finalOptions);
+  if (isDiscordId(chatId)) return discordSend(chatId, text, options, null);
+  const prebuilt = options.parse_mode === 'HTML';
+  const finalText = prebuilt ? text
+    : options.parse_mode === 'Markdown' ? wrapBoxed(text)
+    : wrapPlainBoxed(text);
+  return originalSendMessage(chatId, finalText, { ...options, parse_mode: 'HTML' });
 };
 
-bot.sendPhoto = function (chatId, photo, options = {}) {
+bot.sendPhoto = async function (chatId, photo, options = {}) {
+  if (isDiscordId(chatId)) return discordSend(chatId, options.caption || '', options, photo);
   const caption = options.caption || '';
-
-  if (!isChartImage(photo) && !options.forceImage) {
-    // Coin logo — drop the image, send just the boxed text. Forward all
-    // other options as-is (parse_mode, reply_to_message_id, etc.) so a
-    // caption that's already pre-boxed HTML (like /p's) doesn't get
-    // wrapped a second time.
-    const forwardOptions = { ...options };
-    delete forwardOptions.caption;
-    return bot.sendMessage(chatId, caption, forwardOptions);
+  const prebuilt = options.parse_mode === 'HTML';
+  const finalCaption = prebuilt ? caption
+    : options.parse_mode === 'Markdown' ? wrapBoxed(caption)
+    : wrapPlainBoxed(caption);
+  // Telegram caps photo captions at 1024 chars — send long ones as photo + separate message
+  if (finalCaption.length > 1024) {
+    await originalSendPhoto(chatId, photo, { ...options, caption: undefined, parse_mode: undefined });
+    return originalSendMessage(chatId, finalCaption, { ...options, parse_mode: 'HTML' });
   }
+  return originalSendPhoto(chatId, photo, { ...options, caption: finalCaption, parse_mode: 'HTML' });
+};
 
-  const alreadyBoxed = options.parse_mode === 'HTML';
-  const finalCaption = alreadyBoxed ? caption : wrapBoxed(caption);
-  const finalOptions = withAutoReply(chatId, { ...options, caption: finalCaption, parse_mode: 'HTML' });
-  delete finalOptions.forceImage;
-  return originalSendPhoto(chatId, photo, finalOptions);
+// Registry of every /command handler, so Discord slash commands can reuse the exact
+// same code paths as Telegram (no duplicated logic = no drift between platforms).
+const textHandlers = [];
+const originalOnText = bot.onText.bind(bot);
+bot.onText = function (regexp, callback) {
+  textHandlers.push({ regexp, callback });
+  return originalOnText(regexp, callback);
 };
 
 bot.deleteMyCommands()
@@ -1901,16 +1599,7 @@ bot.onText(/\/w (.+)/, async (msg, match) => {
       return bot.sendMessage(chatId, `⚠️ Couldn't find *${ticker}* on-chain.`, { parse_mode: 'Markdown' });
     }
 
-    const { holders, top10Total, totalSupply, supplyIsEstimated } = await getTopHoldersWithPercentage(contract.chain, contract.address, ticker);
-
-    if (supplyIsEstimated) {
-      return bot.sendMessage(
-        chatId,
-        `⚠️ Couldn't verify *${ticker}*'s real total supply right now (data source unavailable), so a concentration % can't be reliably shown — it would be artificially inflated. Try again shortly.`,
-        { parse_mode: 'Markdown' }
-      );
-    }
-
+    const { holders, top10Total, totalSupply } = await getTopHoldersWithPercentage(contract.chain, contract.address, ticker);
     // Save this snapshot for cross-token wallet correlation
     try {
       const checkedAt = Date.now();
@@ -1923,7 +1612,7 @@ bot.onText(/\/w (.+)/, async (msg, match) => {
     } catch (err) {
       console.error('Failed to save holder snapshot:', err.message);
            }
-    const risk      = assessConcentrationRisk(top10Total, contract.chain, holders[0]?.percentage);
+    const risk      = assessConcentrationRisk(top10Total);
     const chartUrl = generatePieChartUrl(holders, top10Total, ticker);
 
     const holderLines = holders.slice(0, 5).map((h, i) =>
@@ -2061,10 +1750,10 @@ bot.onText(/\/watchdev (.+)/, async (msg, match) => {
 
   try {
     await pool.query(
-      `INSERT INTO dev_watches (user_id, chat_id, username, ticker, chain, dev_address, last_tx_hash, last_checked_at, created_at, message_id)
-       VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $7, $8)
-       ON CONFLICT (user_id, ticker) DO UPDATE SET dev_address = $6, chain = $5, last_tx_hash = NULL, last_checked_at = $7, message_id = $8`,
-      [userId, chatId, username, ticker, contract.chain, devHistory.creator, Date.now(), msg.message_id]
+      `INSERT INTO dev_watches (user_id, chat_id, username, ticker, chain, dev_address, last_tx_hash, last_checked_at, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $7)
+       ON CONFLICT (user_id, ticker) DO UPDATE SET dev_address = $6, chain = $5, last_tx_hash = NULL, last_checked_at = $7`,
+      [userId, chatId, username, ticker, contract.chain, devHistory.creator, Date.now()]
     );
 
     bot.sendMessage(
@@ -2139,23 +1828,17 @@ bot.onText(/\/p (.+)/, async (msg, match) => {
     ? `${data.change7d >= 0 ? '📈' : '📉'} ${data.change7d.toFixed(2)}%`
     : '❓ N/A';
 
-  const priceStr = data.price != null ? `$${data.price.toLocaleString(undefined, { maximumSignificantDigits: 6 })}` : 'N/A';
-
-  const rawCaption =
+  const caption =
     `💰 *${data.name} (${data.symbol})*\n\n` +
-    `Price:      *${priceStr}*\n` +
+    `Price:      $${data.price != null ? data.price.toLocaleString(undefined, { maximumSignificantDigits: 6 }) : 'N/A'}\n` +
     `24h change: ${change24hStr}\n` +
     `7d change:  ${change7dStr}\n` +
     `Market cap: ${fmt(data.marketCap)}\n` +
     `24h volume: ${fmt(data.volume24h)}\n` +
     `ATH:        ${data.ath != null ? `$${data.ath.toLocaleString()}` : 'N/A'}`;
 
-  // Built as pre-boxed HTML (no header bar) so we bypass the universal
-  // auto-wrap that would otherwise add the "COINRADAR" header on top.
-  const caption = wrapBoxedNoHeader(rawCaption);
-
-  if (data.logoImage) bot.sendPhoto(chatId, data.logoImage, { caption, parse_mode: 'HTML' });
-  else bot.sendMessage(chatId, caption, { parse_mode: 'HTML' });
+  if (data.logoImage) bot.sendPhoto(chatId, data.logoImage, { caption, parse_mode: 'Markdown' });
+  else bot.sendMessage(chatId, caption, { parse_mode: 'Markdown' });
 });
 
 // ─── /trending ────────────────────────────────────────────────────────────────
@@ -2163,25 +1846,19 @@ bot.onText(/\/p (.+)/, async (msg, match) => {
 bot.onText(/\/trending/, async (msg) => {
   const chatId = msg.chat.id;
   bot.sendMessage(chatId, `🔥 Fetching trending tokens...`);
-  if (!(await premiumGate(msg, 'trending'))) return;
-
-  try {
-    const coins = await fetchTrending();
-    if (!coins || coins.length === 0) {
-      return bot.sendMessage(chatId, '⚠️ Could not fetch trending data right now. Try again shortly.');
-    }
-
-    const lines = coins.map((c, i) => {
-      const changeStr = c.change24h != null ? ` (${c.change24h >= 0 ? '+' : ''}${c.change24h.toFixed(1)}%)` : '';
-      const priceStr  = c.price ? ` — $${parseFloat(c.price).toLocaleString(undefined, { maximumSignificantDigits: 4 })}` : '';
-      return `${i + 1}. *${c.name}* (${c.symbol})${priceStr}${changeStr}`;
-    }).join('\n');
-
-    bot.sendMessage(chatId, `🔥 *Top Gainers (24h)*\n\n${lines}`, { parse_mode: 'Markdown' });
-  } catch (err) {
-    console.error('/trending error:', err.message);
-    bot.sendMessage(chatId, '⚠️ Could not fetch trending data right now. Try again shortly.');
+if (!(await premiumGate(msg, 'trending'))) return;
+  const coins = await fetchTrending();
+  if (!coins || coins.length === 0) {
+    return bot.sendMessage(chatId, '⚠️ Could not fetch trending data right now. Try again shortly.');
   }
+
+  const lines = coins.map((c, i) => {
+    const changeStr = c.change24h != null ? ` (${c.change24h >= 0 ? '+' : ''}${c.change24h.toFixed(1)}%)` : '';
+    const priceStr  = c.price ? ` — $${parseFloat(c.price).toLocaleString(undefined, { maximumSignificantDigits: 4 })}` : '';
+    return `${i + 1}. *${c.name}* (${c.symbol})${priceStr}${changeStr}`;
+  }).join('\n');
+
+  bot.sendMessage(chatId, `🔥 *Top Gainers (24h)*\n\n${lines}`, { parse_mode: 'Markdown' });
 });
 
 // ─── /whale ───────────────────────────────────────────────────────────────────
@@ -2191,27 +1868,22 @@ bot.onText(/^\/whale$/, (msg) => bot.sendMessage(msg.chat.id, '🐋 Include a ti
 bot.onText(/\/whale (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const ticker = match[1].trim().toUpperCase();
-  if (!(await premiumGate(msg, 'whale'))) return;
-
+if (!(await premiumGate(msg, 'whale'))) return;
+  
   bot.sendMessage(chatId, `🐋 Looking up whale transfers for *${ticker}*...`, { parse_mode: 'Markdown' });
 
-  try {
-    let contract = await getTokenContract(ticker);
-    if (!contract) contract = await searchDexScreener(ticker);
-    if (!contract || !contract.address) {
-      return bot.sendMessage(chatId, `⚠️ Couldn't find *${ticker}* on-chain.`, { parse_mode: 'Markdown' });
-    }
-
-    const result = await fetchWhaleTransfers(contract.chain, contract.address, ticker);
-    bot.sendMessage(
-      chatId,
-      `🐋 *Whale Transfers — ${ticker} (${contract.chain.toUpperCase()})*\n\n${result}`,
-      { parse_mode: 'Markdown' }
-    );
-  } catch (err) {
-    console.error('/whale error:', err.message);
-    bot.sendMessage(chatId, `⚠️ Failed to fetch whale transfers for ${ticker}. Possible cause: API limit or unsupported chain.`);
+  let contract = await getTokenContract(ticker);
+  if (!contract) contract = await searchDexScreener(ticker);
+  if (!contract || !contract.address) {
+    return bot.sendMessage(chatId, `⚠️ Couldn't find *${ticker}* on-chain.`, { parse_mode: 'Markdown' });
   }
+
+  const result = await fetchWhaleTransfers(contract.chain, contract.address, ticker);
+  bot.sendMessage(
+    chatId,
+    `🐋 *Whale Transfers — ${ticker} (${contract.chain.toUpperCase()})*\n\n${result}`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
 
@@ -2361,9 +2033,9 @@ bot.onText(/\/alert (.+)/, async (msg, match) => {
 
   try {
     await pool.query(
-      `INSERT INTO price_alerts (user_id, chat_id, username, ticker, target_price, direction, created_at, recurring, message_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-      [userId, chatId, username, ticker, targetPrice, direction, Date.now(), isRecurring, msg.message_id]
+      `INSERT INTO price_alerts (user_id, chat_id, username, ticker, target_price, direction, created_at, recurring)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [userId, chatId, username, ticker, targetPrice, direction, Date.now(), isRecurring]
     );
 
     const arrow = direction === 'above' ? '📈' : '📉';
@@ -2586,7 +2258,9 @@ bot.onText(/\/status/, (msg) => {
   const lastCheck = lastCheckTime ? `${Math.floor((Date.now() - lastCheckTime) / 60000)} min ago` : 'not yet run';
   bot.sendMessage(
     msg.chat.id,
-    `📡 *CoinRadar Status*\n\nUptime: ${uptime} min\nLast Bybit check: ${lastCheck}\nNew listings this session: ${listingsSeenToday}`,
+    `📡 *CoinRadar Status*\n\nUptime: ${uptime} min\nLast Bybit check: ${lastCheck}\nNew listings this session: ${listingsSeenToday}\n\n` +
+    `*Bybit* — HTTP ${bybitStats.http ?? 'n/a'}, ${bybitStats.items} items, ${bybitStats.matched} matched, error: ${bybitStats.error || 'none'}\n` +
+    `*OKX* — HTTP ${okxStats.http ?? 'n/a'}, ${okxStats.items} items, ${okxStats.matched} matched, error: ${okxStats.error || 'none'}`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -2595,28 +2269,16 @@ bot.onText(/\/testalert/, async (msg) => {
   if (!isAdmin(msg.from.id)) return;
   const title = 'Pepe (PEPE) Gets Listed on Bybit Spot';
   const safetyResult = await runSafetyCheckByTitle(title);
-  const caption = `🚨 TEST ALERT — Bybit Listing\n\n${title}\n\n🔗 https://announcements.bybit.com/example${safetyResult ? `\n\n${safetyResult.text}` : ''}`;
-  if (safetyResult?.image) bot.sendPhoto(msg.chat.id, safetyResult.image, { caption });
-  else bot.sendMessage(msg.chat.id, caption);
+  await sendListingAlert(msg.chat.id, 'Bybit (TEST)', title, 'https://announcements.bybit.com/example', safetyResult);
 });
 
-bot.onText(/\/broadcast(?:\s+([\s\S]+))?/, async (msg, match) => {
-  if (!isAdmin(msg.from.id)) {
-    console.log(`/broadcast blocked — from.id ${msg.from.id} does not match MY_CHAT_ID`);
-    return bot.sendMessage(msg.chat.id, '⛔ Admins only.');
-  }
-  const text = (match[1] || '').trim();
-  if (!text) {
-    return bot.sendMessage(msg.chat.id, 'Usage: /broadcast <message>');
-  }
-  // Get every user who has ever messaged the bot. usage_log undercounts
-  // badly — it only gets a row from the premium free-trial path, and the
-  // admin is explicitly exempt from that logging — so known_users (updated
-  // on every incoming message) is the real source of truth here.
+bot.onText(/\/broadcast (.+)/, async (msg, match) => {
+  if (!isAdmin(msg.from.id)) return;
+  const text = match[1].trim();
+  // Get all unique user_ids who have ever used the bot
   try {
-    const r = await pool.query('SELECT DISTINCT user_id FROM known_users');
-    const users = new Set(r.rows.map((row) => Number(row.user_id)));
-    if (myChatId) users.add(Number(myChatId));
+    const r = await pool.query('SELECT DISTINCT user_id FROM usage_log');
+    const users = r.rows.map((row) => row.user_id);
     let sent = 0, failed = 0;
     for (const uid of users) {
       try {
@@ -2675,10 +2337,7 @@ async function checkDevWatches() {
             `Tx: \`${latestTx.hash.slice(0, 10)}...\`\n\n` +
             `_This can be routine activity or may precede a sell-off. Always verify independently._`;
 
-          await bot.sendMessage(watch.chat_id, message, {
-            parse_mode: 'Markdown',
-            ...(watch.message_id ? { reply_to_message_id: watch.message_id, allow_sending_without_reply: true } : {}),
-          });
+          await bot.sendMessage(watch.chat_id, message, { parse_mode: 'Markdown' });
         }
 
         await pool.query(
@@ -2724,10 +2383,7 @@ async function checkPriceAlerts() {
           `Current: $${currentPrice.toLocaleString(undefined, { maximumSignificantDigits: 6 })}`;
 
         try {
-          await bot.sendMessage(alert.chat_id, message, {
-            parse_mode: 'Markdown',
-            ...(alert.message_id ? { reply_to_message_id: alert.message_id, allow_sending_without_reply: true } : {}),
-          });
+          await bot.sendMessage(alert.chat_id, message, { parse_mode: 'Markdown' });
 
           if (alert.recurring) {
             // Flip direction so it must cross back before firing again
@@ -2756,255 +2412,253 @@ setTimeout(() => {
   checkDevWatches();
   setInterval(checkDevWatches, 40 * 60 * 1000); // every 40 minutes
 }, 8000);
-
-// ─── WEBSITE API LAYER ──────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// ─── DISCORD LAYER ────────────────────────────────────────────────────────────
+// Optional. Enabled only when DISCORD_TOKEN and DISCORD_CLIENT_ID are set.
 //
-// Exposes the same core data the Telegram bot uses (price, safety check,
-// holder concentration) as plain JSON over HTTP, so the website/PWA can
-// call it directly instead of duplicating all the fetch/analysis logic.
-//
-// These builder functions intentionally duplicate (rather than replace) the
-// logic inside the existing /c and /w Telegram command handlers — pulling
-// those handlers apart to share code would risk changing behavior on
-// commands that already work correctly in production. This is a known,
-// deliberate tradeoff to revisit once the website is stable: worth
-// consolidating later, not worth the risk right now.
+// How it works (no logic is duplicated):
+//   1. Each Discord slash command is turned back into the text a Telegram user would
+//      type ("/alert BTC 70000") and fed to the SAME bot.onText handlers.
+//   2. Those handlers call bot.sendMessage / bot.sendPhoto with the Discord channel id.
+//      The monkey-patch above sees a Discord id and hands the message to discordSend(),
+//      which renders it as an embed and replies to the interaction.
+//   3. AsyncLocalStorage carries "which interaction am I answering?" through the
+//      handler's awaits, so concurrent commands never get their replies mixed up.
+// ═══════════════════════════════════════════════════════════════════════════════
 
-const NATIVE_COINS = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'ADA', 'DOGE', 'LTC', 'AVAX', 'DOT', 'MATIC', 'TRX', 'XMR', 'ZEC'];
+const discordStore = new AsyncLocalStorage();
+let discordClient = null;
+const DISCORD_COLOR = 0x2b8cff;
 
-async function buildSafetyCheckData(ticker) {
-  let contract = await getTokenContract(ticker);
-  if (!contract) contract = await searchDexScreener(ticker);
-
-  if (!contract || !contract.address) {
-    return {
-      ticker,
-      found: false,
-      nativeAsset: NATIVE_COINS.includes(ticker),
-    };
-  }
-
-  const [verified, liquidityResult, age, volume, devHistory] = await Promise.all([
-    checkContractVerified(contract.chain, contract.address),
-    checkLiquidity(contract.address),
-    checkTokenAge(contract.chain, contract.address),
-    check24hTxVolume(contract.address),
-    getDevWalletHistory(contract.chain, contract.address),
-  ]);
-
-  const devRisk = devHistory ? assessDevRisk(devHistory.deployCount) : null;
-  const mintBad = verified.includes('Mint authority active') || verified.includes('Freeze authority active');
-  const riskScore = assessSafetyRisk(verified, liquidityResult.text, mintBad, !!devRisk);
-
-  return {
-    ticker,
-    found: true,
-    chain: contract.chain,
-    address: contract.address,
-    contractVerified: verified,
-    liquidity: liquidityResult.text,
-    age,
-    volume24h: volume,
-    devWallet: devRisk ? { risk: devRisk, deployCount: devHistory.deployCount } : null,
-    riskScore,
-    image: liquidityResult.image || contract.logoImage || null,
-  };
+// Telegram-legacy-Markdown → Discord Markdown.
+// Telegram: *bold* _italic_    Discord: **bold** *italic*
+function mdToDiscord(text) {
+  const stash = [];
+  const keep = (s) => { stash.push(s); return `\u0000${stash.length - 1}\u0000`; };
+  let t = String(text)
+    .replace(/```[\s\S]*?```/g, keep)
+    .replace(/`[^`\n]+`/g, keep)
+    .replace(/\[[^\]\n]+\]\([^)\s]+\)/g, keep)
+    .replace(/https?:\/\/\S+/g, keep)
+    .replace(/<@!?\d+>/g, keep);
+  t = t.replace(/\*([^*\n]+)\*/g, (_, a) => keep(`**${a}**`));
+  t = t.replace(/(^|[^\w])_([^_\n]+)_(?=[^\w]|$)/g, (_, p, a) => p + keep(`*${a}*`));
+  while (/\u0000\d+\u0000/.test(t)) t = t.replace(/\u0000(\d+)\u0000/g, (_, i) => stash[Number(i)]);
+  return t;
 }
 
-async function buildHolderAnalysisData(ticker) {
-  let contract = await getTokenContract(ticker);
-  if (!contract) contract = await searchDexScreener(ticker);
-  if (!contract || !contract.address) {
-    return { ticker, found: false };
+function discordPayload(text, photo, parseMode) {
+  const { EmbedBuilder } = require('discord.js');
+  const body = parseMode === 'Markdown' ? mdToDiscord(text) : String(text);
+  const embed = new EmbedBuilder()
+    .setColor(DISCORD_COLOR)
+    .setAuthor({ name: '📡 COINRADAR' })
+    .setDescription(body.slice(0, 4000) || '​')
+    .setFooter({ text: 'CoinRadar • Signalcraft' });
+  const payload = { embeds: [embed], allowedMentions: { parse: ['users'] } };
+
+  if (photo) {
+    if (typeof photo === 'string') {
+      embed.setImage(photo);
+    } else if (Buffer.isBuffer(photo)) {
+      payload.files = [{ attachment: photo, name: 'chart.png' }];
+      embed.setImage('attachment://chart.png');
+    }
   }
-
-  const { holders, top10Total, totalSupply, supplyIsEstimated } = await getTopHoldersWithPercentage(contract.chain, contract.address, ticker);
-
-  if (supplyIsEstimated) {
-    return {
-      ticker,
-      found: true,
-      chain: contract.chain,
-      address: contract.address,
-      supplyVerified: false,
-      error: 'Total supply could not be verified — concentration % would be unreliable, so it is omitted.',
-    };
-  }
-
-  const risk = assessConcentrationRisk(top10Total, contract.chain, holders[0]?.percentage);
-
-  return {
-    ticker,
-    found: true,
-    supplyVerified: true,
-    chain: contract.chain,
-    address: contract.address,
-    top10Percent: top10Total,
-    totalSupply,
-    holders: holders.slice(0, 10).map((h) => ({ address: h.address, percentage: h.percentage })),
-    risk,
-  };
+  // Mentions inside embeds don't ping — put them in the message content so they do.
+  const mentions = [...new Set(body.match(/<@!?\d+>/g) || [])];
+  if (mentions.length) payload.content = mentions.join(' ');
+  return payload;
 }
 
-// Structured counterpart to fetchWhaleTransfers (which returns Telegram
-// markdown). Same deliberate-duplication tradeoff as buildSafetyCheckData /
-// buildHolderAnalysisData above — reuses the same data sources but returns
-// plain JSON events {time, value, from, to} for the charting site to plot
-// as timeline markers, instead of a formatted message string.
-async function buildWhaleAlertData(ticker) {
-  let contract = await getTokenContract(ticker);
-  if (!contract) contract = await searchDexScreener(ticker);
-  if (!contract || !contract.address) {
-    return { ticker, found: false };
-  }
-
-  const { chain, address } = contract;
-
-  // Solana: Helius free tier only gives signatures/timestamps, not reliable
-  // transfer amounts — so whale markers aren't currently supported for Solana.
-  if (chain === 'sol') {
-    return {
-      ticker, found: true, chain, address,
-      supported: false,
-      error: 'Whale transfer amounts require a paid Helius plan on Solana — not available yet.',
-    };
-  }
-
+// Single exit point for everything the bot says on Discord.
+async function discordSend(chatId, text, options = {}, photo = null) {
+  if (!discordClient) return null;
   try {
-    let parsed = [];
+    const payload = discordPayload(text, photo, options.parse_mode);
+    const ctx = discordStore.getStore();
 
-    if (moralisKey) {
-      const chainId = chain === 'eth' ? 'eth' : 'bsc';
-      const res = await fetchWithRetry(
-        `https://deep-index.moralis.io/api/v2.2/erc20/${address}/transfers?chain=${chainId}&limit=50`,
-        { headers: { 'X-API-Key': moralisKey, 'Accept': 'application/json' } }
-      );
-      const data = await res.json();
-      const txs = data?.result;
-      if (Array.isArray(txs) && txs.length > 0) {
-        parsed = txs.map((tx) => ({
-          from: tx.from_address,
-          to: tx.to_address,
-          value: parseFloat(tx.value) / Math.pow(10, parseInt(tx.token_decimals || 18)),
-          time: new Date(tx.block_timestamp),
-          hash: tx.transaction_hash,
-        }));
+    // Inside a slash command → reply to that interaction (first = edit the "thinking…", then follow-ups)
+    if (ctx && String(ctx.channelId) === String(chatId)) {
+      if (!ctx.replied) {
+        ctx.replied = true; // set synchronously so parallel sends can't both "edit"
+        return await ctx.interaction.editReply(payload);
       }
+      return await ctx.interaction.followUp(payload);
     }
 
-    if (parsed.length === 0) {
-      const chainId = chain === 'eth' ? 1 : 56;
-      const baseUrl = `https://api.etherscan.io/v2/api?chainid=${chainId}`;
-      const res = await fetchWithRetry(
-        `${baseUrl}&module=account&action=tokentx&contractaddress=${address}&page=1&offset=50&sort=desc&apikey=${etherscanKey}`
-      );
-      const data = await res.json();
-      const txs = data?.result;
-      if (Array.isArray(txs) && txs.length > 0) {
-        const decimals = parseInt(txs[0]?.tokenDecimal || 18);
-        const seenHashes = new Set();
-        for (const tx of txs) {
-          if (seenHashes.has(tx.hash)) continue;
-          seenHashes.add(tx.hash);
-          parsed.push({
-            from: tx.from,
-            to: tx.to,
-            value: parseFloat(tx.value) / Math.pow(10, decimals),
-            time: new Date(Number(tx.timeStamp) * 1000),
-            hash: tx.hash,
-          });
-        }
-      }
-    }
-
-    if (parsed.length === 0) {
-      return { ticker, found: true, chain, address, supported: true, events: [] };
-    }
-
-    // Same A→B→C collapse as fetchWhaleTransfers, to avoid one real move
-    // showing up as two separate markers on the chart
-    const toAddresses = new Set(parsed.map((tx) => tx.to));
-    const filtered = parsed.filter((tx) => !toAddresses.has(tx.from));
-    const whales = filtered.sort((a, b) => b.value - a.value).slice(0, 10);
-
-    return {
-      ticker, found: true, chain, address, supported: true,
-      events: whales.map((tx) => ({
-        time: Math.floor(tx.time.getTime() / 1000), // unix seconds, matches Lightweight Charts time format
-        value: tx.value,
-        from: tx.from,
-        to: tx.to,
-        hash: tx.hash || null,
-      })),
-    };
+    // Background delivery (price alerts, dev watches, listings) → post to the channel,
+    // falling back to a DM if the id is a user.
+    const channel = await discordClient.channels.fetch(String(chatId)).catch(() => null);
+    if (channel && channel.send) return await channel.send(payload);
+    const user = await discordClient.users.fetch(String(chatId)).catch(() => null);
+    if (user) return await user.send(payload);
+    console.error('Discord delivery failed: unknown channel/user', chatId);
   } catch (err) {
-    console.error('buildWhaleAlertData failed:', err.message);
-    return { ticker, found: true, chain, address, supported: true, events: [], error: 'Whale data temporarily unavailable' };
+    console.error('Discord send error:', err.message);
+  }
+  return null;
+}
+
+// Slash command definitions. Option order = the order the args are rebuilt into text.
+// type 3 = string, 4 = integer, 5 = boolean. Required options must come first.
+const DC_STR = 3, DC_INT = 4, DC_BOOL = 5;
+const ticker = (desc = 'Token ticker, e.g. pepe') => ({ name: 'ticker', description: desc, type: DC_STR, required: true });
+const DISCORD_COMMANDS = [
+  { name: 'start',       description: 'Start CoinRadar' },
+  { name: 'help',        description: 'All commands', options: [{ name: 'topic', description: 'market, alerts, portfolio or account', type: DC_STR }] },
+  { name: 'c',           description: 'Safety check on a token', options: [ticker()] },
+  { name: 'w',           description: 'Top 10 holder concentration chart', options: [ticker()] },
+  { name: 'connections', description: 'Find tokens sharing the same whale wallets', options: [ticker()] },
+  { name: 'watchdev',    description: "Watch a token's deployer wallet", options: [ticker()] },
+  { name: 'mywatches',   description: 'View your dev wallet watches' },
+  { name: 'unwatchdev',  description: 'Remove a dev wallet watch', options: [{ name: 'id', description: 'Watch ID from /mywatches', type: DC_INT, required: true }] },
+  { name: 'p',           description: 'Price, market cap and 24h change', options: [ticker()] },
+  { name: 'chart',       description: 'Live TradingView chart', options: [
+      { name: 'symbol',    description: 'e.g. BTCUSDT', type: DC_STR, required: true },
+      { name: 'exchange',  description: 'e.g. BINANCE', type: DC_STR, required: true },
+      { name: 'timeframe', description: '1m 5m 15m 1h 4h 1D 1W', type: DC_STR, required: true } ] },
+  { name: 'trending',    description: 'Top trending tokens right now' },
+  { name: 'whale',       description: 'Recent large transfers for a token', options: [ticker()] },
+  { name: 'track',       description: 'Track a holding in your portfolio', options: [
+      ticker('Ticker, e.g. BTC'),
+      { name: 'amount', description: 'How much you hold, e.g. 0.5', type: DC_STR, required: true } ] },
+  { name: 'untrack',     description: 'Remove a holding', options: [ticker('Ticker to remove')] },
+  { name: 'portfolio',   description: 'View your portfolio value' },
+  { name: 'alert',       description: 'Set a price alert', options: [
+      ticker('Ticker, e.g. BTC'),
+      { name: 'price', description: 'Target price, e.g. 70000', type: DC_STR, required: true },
+      { name: 'recurring', description: 'Fire every time price crosses, not just once', type: DC_BOOL } ] },
+  { name: 'myalerts',    description: 'View your active alerts' },
+  { name: 'removealert', description: 'Delete an alert', options: [{ name: 'id', description: 'Alert ID from /myalerts', type: DC_INT, required: true }] },
+  { name: 'upgrade',     description: 'See CoinRadar Premium plans' },
+  { name: 'mystatus',    description: 'Your subscription status' },
+  { name: 'setlistings', description: 'Post Bybit/OKX listing alerts in THIS channel (server admins)', dm_permission: false, default_member_permissions: '32' },
+  { name: 'stoplistings', description: 'Stop listing alerts for this server (server admins)', dm_permission: false, default_member_permissions: '32' },
+];
+
+// Discord Premium Apps: if SKU ids are configured, active entitlements on the
+// interaction unlock the matching tier (user subs → user, server subs → this channel).
+async function syncDiscordEntitlements(interaction) {
+  try {
+    const ents = interaction.entitlements;
+    const skuReg = process.env.DISCORD_SKU_REGULAR, skuPro = process.env.DISCORD_SKU_PRO;
+    if (!ents || !ents.size || (!skuReg && !skuPro)) return;
+    for (const e of ents.values()) {
+      if (e.skuId !== skuReg && e.skuId !== skuPro) continue;
+      if (typeof e.isActive === 'function' && !e.isActive()) continue;
+      const tier = e.skuId === skuPro ? 'pro' : 'regular';
+      const expiry = e.endsTimestamp || Date.now() + 30 * 24 * 60 * 60 * 1000;
+      if (e.guildId) await setPaidChat(interaction.channelId, expiry, tier);
+      else await setPaidUser(interaction.user.id, expiry, tier);
+    }
+  } catch (err) {
+    console.error('Entitlement sync failed:', err.message);
   }
 }
 
-const app = express();
-
-// Minimal manual CORS handling (no extra dependency) — the website will be
-// on a different domain (e.g. Vercel) than this API (Railway), so browsers
-// need these headers present or every request gets silently blocked.
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
-});
-
-app.get('/api/health', (req, res) => res.json({ status: 'ok', service: 'coinradar-api' }));
-
-app.get('/api/price/:ticker', async (req, res) => {
-  const ticker = req.params.ticker.trim().toUpperCase();
-  try {
-    const data = await fetchPrice(ticker);
-    if (!data) return res.status(404).json({ error: `No price data found for ${ticker}` });
-    res.json({ ticker, ...data });
-  } catch (err) {
-    console.error('/api/price error:', err.message);
-    res.status(500).json({ error: 'Internal error fetching price' });
+async function handleListingChannelCommand(interaction, enable) {
+  const reply = (t) => interaction.editReply(discordPayload(t, null, 'Markdown'));
+  if (!interaction.inGuild()) return reply('⚠️ Use this inside a server.');
+  if (!interaction.memberPermissions?.has('ManageGuild')) return reply('🔒 You need the *Manage Server* permission to do that.');
+  if (enable) {
+    await pool.query(
+      `INSERT INTO discord_listing_channels (guild_id, channel_id, created_at) VALUES ($1, $2, $3)
+       ON CONFLICT (guild_id) DO UPDATE SET channel_id = $2`,
+      [interaction.guildId, interaction.channelId, Date.now()]
+    );
+    return reply(`✅ Listing alerts will now be posted in <#${interaction.channelId}> — Bybit & OKX, each with an automatic safety check.`);
   }
-});
+  await pool.query('DELETE FROM discord_listing_channels WHERE guild_id = $1', [interaction.guildId]);
+  return reply('🛑 Listing alerts are off for this server.');
+}
 
-app.get('/api/safety/:ticker', async (req, res) => {
-  const ticker = req.params.ticker.trim().toUpperCase();
+async function handleDiscordInteraction(interaction) {
+  if (!interaction.isChatInputCommand()) return;
+  const name = interaction.commandName;
+  const def = DISCORD_COMMANDS.find((c) => c.name === name);
+  if (!def) return;
+
+  // Must acknowledge within 3 seconds — real work (APIs, DB) happens after this.
+  try { await interaction.deferReply(); } catch (err) { console.error('deferReply failed:', err.message); return; }
+
   try {
-    const data = await buildSafetyCheckData(ticker);
-    res.json(data);
-  } catch (err) {
-    console.error('/api/safety error:', err.message);
-    res.status(500).json({ error: 'Internal error running safety check' });
-  }
-});
+    if (name === 'setlistings')  return await handleListingChannelCommand(interaction, true);
+    if (name === 'stoplistings') return await handleListingChannelCommand(interaction, false);
 
-app.get('/api/holders/:ticker', async (req, res) => {
-  const ticker = req.params.ticker.trim().toUpperCase();
+    await syncDiscordEntitlements(interaction);
+
+    // Rebuild the Telegram-style command text from the slash options
+    const parts = [`/${name}`];
+    for (const opt of def.options || []) {
+      const v = interaction.options.get(opt.name)?.value;
+      if (opt.type === DC_BOOL) { if (v) parts.push(opt.name); }
+      else if (v !== undefined && v !== null) parts.push(String(v));
+    }
+    const text = parts.join(' ');
+
+    const ctx = { interaction, channelId: interaction.channelId, replied: false };
+
+    // Telegram Stars can't be paid on Discord — answer /upgrade natively.
+    if (name === 'upgrade') {
+      const hasSkus = process.env.DISCORD_SKU_REGULAR || process.env.DISCORD_SKU_PRO;
+      const tg = process.env.TELEGRAM_BOT_USERNAME ? `@${process.env.TELEGRAM_BOT_USERNAME}` : 'our Telegram bot';
+      await interaction.editReply(discordPayload(
+        `📡 *CoinRadar Premium*\n\n*Regular* — unlimited Premium commands, 3 alert & 3 dev-watch slots.\n*Pro* — everything in Regular, plus unlimited slots & faster dev-watch checks.\n\n` +
+        (hasSkus
+          ? `Subscribe with the *Subscribe* button on the CoinRadar app profile — it unlocks here automatically.`
+          : `Subscriptions are currently sold with Telegram Stars via ${tg} (/upgrade there). Discord checkout is coming soon.`),
+        null, 'Markdown'));
+      return;
+    }
+
+    await discordStore.run(ctx, async () => {
+      const msg = {
+        chat: { id: interaction.channelId, type: interaction.inGuild() ? 'supergroup' : 'private' },
+        from: { id: interaction.user.id, first_name: `<@${interaction.user.id}>` }, // no username → handlers fall back to first_name → real mention
+        text,
+        message_id: 0,
+      };
+      for (const { regexp, callback } of textHandlers) {
+        const match = regexp.exec(text);
+        if (match) await callback(msg, match);
+      }
+    });
+
+    // Handler stayed silent (e.g. admin-only command used by non-admin) — don't leave "thinking…" forever
+    if (!ctx.replied) await interaction.editReply(discordPayload('⚠️ Nothing to show for that command.', null, 'Markdown'));
+  } catch (err) {
+    console.error(`Discord /${name} error:`, err.message);
+    try { await interaction.editReply(discordPayload('⚠️ Something went wrong. Please try again.', null, 'Markdown')); } catch (_) {}
+  }
+}
+
+async function startDiscord() {
+  const dcToken = process.env.DISCORD_TOKEN;
+  const clientId = process.env.DISCORD_CLIENT_ID;
+  if (!dcToken || !clientId) { console.log('ℹ️ Discord disabled (set DISCORD_TOKEN and DISCORD_CLIENT_ID to enable).'); return; }
+
+  const { Client, GatewayIntentBits, REST, Routes, Events } = require('discord.js');
+  discordClient = new Client({ intents: [GatewayIntentBits.Guilds] });
+  discordClient.on(Events.InteractionCreate, (i) => handleDiscordInteraction(i).catch((e) => console.error('Interaction error:', e.message)));
+  discordClient.on('error', (e) => console.error('Discord client error:', e.message));
+  discordClient.once(Events.ClientReady, (c) => console.log(`✅ Discord online as ${c.user.tag}`));
+
   try {
-    const data = await buildHolderAnalysisData(ticker);
-    res.json(data);
+    const rest = new REST({ version: '10' }).setToken(dcToken);
+    // DISCORD_GUILD_ID (optional) registers instantly in one test server; otherwise global.
+    const route = process.env.DISCORD_GUILD_ID
+      ? Routes.applicationGuildCommands(clientId, process.env.DISCORD_GUILD_ID)
+      : Routes.applicationCommands(clientId);
+    await rest.put(route, { body: DISCORD_COMMANDS });
+    console.log(`✅ Registered ${DISCORD_COMMANDS.length} Discord slash commands`);
+    await discordClient.login(dcToken);
   } catch (err) {
-    console.error('/api/holders error:', err.message);
-    res.status(500).json({ error: 'Internal error analyzing holders' });
+    console.error('Discord startup failed:', err.message);
+    discordClient = null;
   }
-});
-
-app.get('/api/whale/:ticker', async (req, res) => {
-  const ticker = req.params.ticker.trim().toUpperCase();
-  try {
-    const data = await buildWhaleAlertData(ticker);
-    res.json(data);
-  } catch (err) {
-    console.error('/api/whale error:', err.message);
-    res.status(500).json({ error: 'Internal error fetching whale data' });
-  }
-});
-
-const apiPort = process.env.PORT || 3000;
-app.listen(apiPort, () => console.log(`🌐 Website API listening on port ${apiPort}`));
+}
+startDiscord();
 
 // ─── BOOT ─────────────────────────────────────────────────────────────────────
 
