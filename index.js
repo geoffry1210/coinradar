@@ -2660,6 +2660,12 @@ async function startDiscord() {
 }
 startDiscord();
 
+// ─── HEALTH ENDPOINT (for UptimeRobot / hosting health checks) ───
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('CoinRadar OK');
+}).listen(process.env.PORT || 3000, () => console.log('✅ Health endpoint up'));
+
 // ─── BOOT ─────────────────────────────────────────────────────────────────────
 
 console.log('📡 CoinRadar bot is running...');
